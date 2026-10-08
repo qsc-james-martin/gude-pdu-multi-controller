@@ -10,7 +10,7 @@
 
 PluginInfo = {
   Name = "Gude~PDU Multi Controller",
-  Version = "1.0.0",
+  Version = "1.0.1",
   Id = "9f79b1c0-43f7-485a-9f80-bc6607cafaec",
   Author = "James Martin",
   Description = "Groups multiple Gude PDU plugins: selective on/off, hold-to-switch all, outlet filters and aggregated metering/status.",
