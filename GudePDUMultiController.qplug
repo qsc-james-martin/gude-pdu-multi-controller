@@ -220,7 +220,7 @@ function GetControlLayout(props)
     local hx = 420
     button("AllOn", "Hold: All On", hx, y1 + 22, 160, 28, { 0, 170, 60 })
     button("AllOff", "Hold: All Off", hx + 168, y1 + 22, 160, 28, { 210, 40, 40 })
-    layout["HoldProgress"] = { Style = "Meter", MeterStyle = "Level", Position = { hx, y1 + 54 }, Size = { 328, 8 } }
+    layout["HoldProgress"] = { Style = "Meter", MeterStyle = "Level", ShowTextbox = false, Position = { hx, y1 + 54 }, Size = { 328, 8 } }
     text("AllScopeResult", hx, y1 + 66, 328, 20, true)
     label("Select PDUs then press On / Off.  Hold All On / All Off for the hold time (Setup page).",
       8, y1 + 88, W - 16, 16, "Left", 10)
