@@ -1,0 +1,921 @@
+-- Gude PDU Multi Controller
+-- Q-SYS plugin that groups several Gude Expert Power Control plugin instances into one panel.
+--  * Select PDUs and switch them on/off
+--  * Press-and-hold All On / All Off with a configurable PDU scope ("1-9", "1-4, 6-9", "all except 10" ...)
+--  * Per-PDU on/off outlet lists (include or exclude outlets)
+--  * Aggregated power / current / energy / voltage (from InletX N or summed OutletX N) plus a combined status
+--
+-- Requirements: each Gude PDU plugin must have Script Access enabled (Script or All).
+-- Gude components are found by plugin GUID 155aca43-286f-4b5d-8063-a567999c55e3.
+
+PluginInfo = {
+  Name = "Gude~PDU Multi Controller",
+  Version = "1.0.0",
+  Id = "9f79b1c0-43f7-485a-9f80-bc6607cafaec",
+  Author = "James Martin",
+  Description = "Groups multiple Gude PDU plugins: selective on/off, hold-to-switch all, outlet filters and aggregated metering/status.",
+  ShowDebug = true
+}
+
+function GetColor(props)
+  return { 0, 94, 168 }
+end
+
+function GetPrettyName(props)
+  return "Gude PDU Multi Controller  v" .. PluginInfo.Version
+end
+
+--------------------------------------------------------------------
+-- Properties
+--------------------------------------------------------------------
+function GetProperties()
+  local props = {}
+  table.insert(props, {
+    Name = "PDU Count",
+    Type = "integer",
+    Min = 1,
+    Max = 32,
+    Value = 4
+  })
+  table.insert(props, {
+    Name = "Metering",
+    Type = "enum",
+    Choices = { "Off", "On" },
+    Value = "Off"
+  })
+  table.insert(props, {
+    Name = "Debug Print",
+    Type = "enum",
+    Choices = { "No", "Yes" },
+    Value = "No"
+  })
+  return props
+end
+
+function RectifyProperties(props)
+  return props
+end
+
+--------------------------------------------------------------------
+-- Controls
+--------------------------------------------------------------------
+function GetControls(props)
+  local n = props["PDU Count"].Value
+  local metering = props["Metering"].Value == "On"
+  local ctls = {}
+
+  local function add(t)
+    t.UserPin = true
+    t.PinStyle = t.PinStyle or "Both"
+    t.Count = t.Count or 1
+    table.insert(ctls, t)
+  end
+
+  -- Combined status / totals
+  add({ Name = "Status", ControlType = "Indicator", IndicatorType = "Status", PinStyle = "Output" })
+  add({ Name = "PDUsOnline", ControlType = "Indicator", IndicatorType = "Text", PinStyle = "Output" })
+  add({ Name = "OutletsOn", ControlType = "Indicator", IndicatorType = "Text", PinStyle = "Output" })
+  if metering then
+    add({ Name = "TotalPower", ControlType = "Indicator", IndicatorType = "Text", PinStyle = "Output" })
+    add({ Name = "TotalCurrent", ControlType = "Indicator", IndicatorType = "Text", PinStyle = "Output" })
+    add({ Name = "TotalEnergy", ControlType = "Indicator", IndicatorType = "Text", PinStyle = "Output" })
+    add({ Name = "AvgVoltage", ControlType = "Indicator", IndicatorType = "Text", PinStyle = "Output" })
+  end
+  add({ Name = "LastAction", ControlType = "Indicator", IndicatorType = "Text", PinStyle = "Output" })
+
+  -- Selection control
+  add({ Name = "Select", ControlType = "Button", ButtonType = "Toggle", Count = n })
+  add({ Name = "SelectAll", ControlType = "Button", ButtonType = "Trigger" })
+  add({ Name = "SelectNone", ControlType = "Button", ButtonType = "Trigger" })
+  add({ Name = "On", ControlType = "Button", ButtonType = "Trigger" })
+  add({ Name = "Off", ControlType = "Button", ButtonType = "Trigger" })
+
+  -- Hold-to-switch all
+  add({ Name = "AllOn", ControlType = "Button", ButtonType = "Momentary" })
+  add({ Name = "AllOff", ControlType = "Button", ButtonType = "Momentary" })
+  add({ Name = "HoldProgress", ControlType = "Indicator", IndicatorType = "Meter", Min = 0, Max = 1, PinStyle = "Output" })
+  add({ Name = "AllScopeResult", ControlType = "Indicator", IndicatorType = "Text", PinStyle = "Output" })
+
+  -- Per-PDU feedback
+  add({ Name = "PduLed", ControlType = "Indicator", IndicatorType = "Led", Count = n, PinStyle = "Output" })
+  add({ Name = "PduState", ControlType = "Indicator", IndicatorType = "Text", Count = n, PinStyle = "Output" })
+  if metering then
+    add({ Name = "PduPower", ControlType = "Indicator", IndicatorType = "Text", Count = n, PinStyle = "Output" })
+    add({ Name = "PduCurrent", ControlType = "Indicator", IndicatorType = "Text", Count = n, PinStyle = "Output" })
+    add({ Name = "PduEnergy", ControlType = "Indicator", IndicatorType = "Text", Count = n, PinStyle = "Output" })
+  end
+  add({ Name = "PduStatus", ControlType = "Indicator", IndicatorType = "Status", Count = n, PinStyle = "Output" })
+
+  -- Setup: per-PDU
+  add({ Name = "ComponentName", ControlType = "Text", Count = n })
+  add({ Name = "PduName", ControlType = "Text", Count = n })
+  add({ Name = "OnOutlets", ControlType = "Text", Count = n })
+  add({ Name = "OffOutlets", ControlType = "Text", Count = n })
+  add({ Name = "Resolved", ControlType = "Indicator", IndicatorType = "Text", Count = n, PinStyle = "Output" })
+
+  -- Setup: global
+  add({ Name = "AllScope", ControlType = "Text", DefaultValue = "all" })
+  add({ Name = "DefaultOnOutlets", ControlType = "Text", DefaultValue = "all" })
+  add({ Name = "DefaultOffOutlets", ControlType = "Text", DefaultValue = "all" })
+  add({ Name = "HoldTime", ControlType = "Knob", ControlUnit = "Seconds", Min = 0, Max = 10, DefaultValue = 2 })
+  add({ Name = "Stagger", ControlType = "Knob", ControlUnit = "Seconds", Min = 0, Max = 5, DefaultValue = 0.1 })
+  add({ Name = "PollInterval", ControlType = "Knob", ControlUnit = "Seconds", Min = 1, Max = 60, DefaultValue = 3 })
+  add({ Name = "AutoClear", ControlType = "Button", ButtonType = "Toggle", DefaultValue = true })
+
+  -- Setup: metering
+  if metering then
+    add({ Name = "MeterSource", ControlType = "Text", DefaultValue = "Inlets" })
+  end
+
+  return ctls
+end
+
+--------------------------------------------------------------------
+-- Layout
+--------------------------------------------------------------------
+local PageNames = { "Control", "Setup" }
+
+function GetPages(props)
+  local pages = {}
+  for _, name in ipairs(PageNames) do
+    table.insert(pages, { name = name })
+  end
+  return pages
+end
+
+function GetControlLayout(props)
+  local layout, graphics = {}, {}
+  local n = props["PDU Count"].Value
+  local metering = props["Metering"].Value == "On"
+  local page = PageNames[props["page_index"].Value]
+  local W = 760
+
+  local function key(name, i)
+    if n > 1 then return name .. " " .. i end
+    return name
+  end
+
+  local function label(text, x, y, w, h, align, size)
+    table.insert(graphics, {
+      Type = "Text", Text = text, Position = { x, y }, Size = { w, h or 18 },
+      FontSize = size or 11, HTextAlign = align or "Right"
+    })
+  end
+
+  local function group(text, x, y, w, h)
+    table.insert(graphics, {
+      Type = "GroupBox", Text = text, Position = { x, y }, Size = { w, h },
+      HTextAlign = "Left", StrokeWidth = 1, CornerRadius = 6, Fill = { 242, 242, 242 }
+    })
+  end
+
+  local function text(name, x, y, w, h, readOnly)
+    layout[name] = {
+      Style = "Text", Position = { x, y }, Size = { w, h or 20 }, FontSize = 11,
+      HTextAlign = "Center", IsReadOnly = readOnly or false
+    }
+  end
+
+  local function button(name, legend, x, y, w, h, color)
+    layout[name] = {
+      Style = "Button", Legend = legend, Position = { x, y }, Size = { w, h or 24 },
+      FontSize = 11, CornerRadius = 4, Color = color
+    }
+  end
+
+  if page == "Control" then
+    -- Combined
+    local y0 = 0
+    group("Combined", 0, y0, W, 100)
+    label("Status", 8, y0 + 22, 56, 20)
+    layout["Status"] = { Style = "Text", Position = { 70, y0 + 22 }, Size = { W - 78, 22 }, FontSize = 11 }
+
+    local cols = {
+      { "PDUsOnline", "PDUs Online", 100 },
+      { "OutletsOn", "Outlets On", 100 },
+    }
+    if metering then
+      table.insert(cols, { "TotalPower", "Total Power", 120 })
+      table.insert(cols, { "TotalCurrent", "Total Current", 120 })
+      table.insert(cols, { "TotalEnergy", "Total Energy", 140 })
+      table.insert(cols, { "AvgVoltage", "Avg Voltage", 120 })
+    end
+    local x = 8
+    for _, c in ipairs(cols) do
+      label(c[2], x, y0 + 50, c[3], 16, "Center")
+      text(c[1], x, y0 + 68, c[3], 22, true)
+      x = x + c[3] + 4
+    end
+
+    -- Control
+    local y1 = y0 + 106
+    group("Control", 0, y1, W, 112)
+    button("SelectAll", "Select All", 8, y1 + 22, 90, 28)
+    button("SelectNone", "Clear", 102, y1 + 22, 90, 28)
+    button("On", "On", 210, y1 + 22, 90, 28, { 0, 170, 60 })
+    button("Off", "Off", 304, y1 + 22, 90, 28, { 210, 40, 40 })
+    label("Last action", 8, y1 + 58, 70, 20, "Left")
+    text("LastAction", 80, y1 + 58, 314, 20, true)
+
+    local hx = 420
+    button("AllOn", "Hold: All On", hx, y1 + 22, 160, 28, { 0, 170, 60 })
+    button("AllOff", "Hold: All Off", hx + 168, y1 + 22, 160, 28, { 210, 40, 40 })
+    layout["HoldProgress"] = { Style = "Meter", MeterStyle = "Level", Position = { hx, y1 + 54 }, Size = { 328, 8 } }
+    text("AllScopeResult", hx, y1 + 66, 328, 20, true)
+    label("Select PDUs then press On / Off.  Hold All On / All Off for the hold time (Setup page).",
+      8, y1 + 88, W - 16, 16, "Left", 10)
+
+    -- PDUs
+    local y2 = y1 + 118
+    local rowH = 26
+    group("PDUs", 0, y2, W, 50 + n * rowH)
+    local cx = { sel = 8, led = 144, state = 168, pw = 272, cur = 360, en = 448, st = metering and 548 or 272 }
+    label("Select", cx.sel, y2 + 20, 130, 16, "Center")
+    label("State", cx.state, y2 + 20, 100, 16, "Center")
+    if metering then
+      label("Power", cx.pw, y2 + 20, 84, 16, "Center")
+      label("Current", cx.cur, y2 + 20, 84, 16, "Center")
+      label("Energy", cx.en, y2 + 20, 96, 16, "Center")
+    end
+    label("PDU Status", cx.st, y2 + 20, W - cx.st - 8, 16, "Center")
+    for i = 1, n do
+      local y = y2 + 40 + (i - 1) * rowH
+      button(key("Select", i), "PDU " .. i, cx.sel, y, 130, 22)
+      layout[key("PduLed", i)] = { Style = "Led", Position = { cx.led, y + 3 }, Size = { 16, 16 }, Color = { 0, 220, 0 } }
+      text(key("PduState", i), cx.state, y + 1, 100, 20, true)
+      if metering then
+        text(key("PduPower", i), cx.pw, y + 1, 84, 20, true)
+        text(key("PduCurrent", i), cx.cur, y + 1, 84, 20, true)
+        text(key("PduEnergy", i), cx.en, y + 1, 96, 20, true)
+      end
+      layout[key("PduStatus", i)] = { Style = "Text", Position = { cx.st, y + 1 }, Size = { W - cx.st - 8, 20 }, FontSize = 10 }
+    end
+
+  elseif page == "Setup" then
+    local rowH = 26
+    -- PDU assignment
+    local y0 = 0
+    local hAssign = 50 + n * rowH
+    group("PDU Assignment  (blank outlet fields use the defaults below)", 0, y0, W, hAssign)
+    local cx = { num = 8, comp = 36, name = 214, on = 342, off = 450, res = 558 }
+    label("Component", cx.comp, y0 + 20, 174, 16, "Center")
+    label("Display Name", cx.name, y0 + 20, 124, 16, "Center")
+    label("On Outlets", cx.on, y0 + 20, 104, 16, "Center")
+    label("Off Outlets", cx.off, y0 + 20, 104, 16, "Center")
+    label("Resolved", cx.res, y0 + 20, W - cx.res - 8, 16, "Center")
+    for i = 1, n do
+      local y = y0 + 40 + (i - 1) * rowH
+      label(tostring(i), cx.num, y + 1, 24, 20, "Center")
+      layout[key("ComponentName", i)] = { Style = "ComboBox", Position = { cx.comp, y }, Size = { 174, 22 }, FontSize = 11 }
+      text(key("PduName", i), cx.name, y + 1, 124, 20)
+      text(key("OnOutlets", i), cx.on, y + 1, 104, 20)
+      text(key("OffOutlets", i), cx.off, y + 1, 104, 20)
+      layout[key("Resolved", i)] = {
+        Style = "Text", Position = { cx.res, y + 1 }, Size = { W - cx.res - 8, 20 }, FontSize = 10,
+        HTextAlign = "Left", IsReadOnly = true
+      }
+    end
+
+    -- Global settings
+    local y1 = y0 + hAssign + 6
+    group("Global Settings", 0, y1, W, metering and 240 or 214)
+    local lx, lw, vx = 8, 170, 184
+    local function row(r) return y1 + 22 + (r - 1) * 26 end
+    label("All On / All Off PDUs", lx, row(1), lw, 20)
+    text("AllScope", vx, row(1), 200, 20)
+    label("e.g.  all  |  1-9  |  1-4, 6-9  |  all except 10  |  !5", vx + 208, row(1), 360, 20, "Left", 10)
+    label("Default On Outlets", lx, row(2), lw, 20)
+    text("DefaultOnOutlets", vx, row(2), 200, 20)
+    label("Default Off Outlets", lx, row(3), lw, 20)
+    text("DefaultOffOutlets", vx, row(3), 200, 20)
+    label("Outlets: all  |  1-6  |  all except 1  |  !1, !8  |  none", vx + 208, row(2), 360, 20, "Left", 10)
+    label("Per-PDU fields above override these.", vx + 208, row(3), 360, 20, "Left", 10)
+    label("Hold Time (s)", lx, row(4), lw, 20)
+    text("HoldTime", vx, row(4), 80, 20)
+    label("PDU Stagger (s)", lx, row(5), lw, 20)
+    text("Stagger", vx, row(5), 80, 20)
+    label("Poll Interval (s)", lx, row(6), lw, 20)
+    text("PollInterval", vx, row(6), 80, 20)
+    label("Clear Selection After On/Off", lx, row(7), lw, 20)
+    button("AutoClear", "", vx, row(7), 36, 20)
+    if metering then
+      label("Meter Source", lx, row(8), lw, 20)
+      layout["MeterSource"] = { Style = "ComboBox", Position = { vx, row(8) - 1 }, Size = { 200, 22 }, FontSize = 11 }
+      label("Inlets: inlet totals   |   Outlets: sum of outlet readings (no energy)",
+        vx + 208, row(8), W - vx - 216, 20, "Left", 10)
+    end
+  end
+
+  return layout, graphics
+end
+
+--------------------------------------------------------------------
+-- Runtime
+--------------------------------------------------------------------
+if Controls then
+  local N = Properties["PDU Count"].Value
+  local DEBUG = Properties["Debug Print"].Value == "Yes"
+  local METERING = Properties["Metering"].Value == "On"
+
+  local function log(...)
+    if DEBUG then print(...) end
+  end
+
+  -- Controls with Count = 1 are single objects, otherwise arrays
+  local function arr(c)
+    if c == nil then return {} end
+    if type(c) == "table" and c[1] ~= nil then return c end
+    return { c }
+  end
+
+  local C = {}
+  for _, name in ipairs({ "Select", "PduLed", "PduState", "PduPower", "PduCurrent", "PduEnergy", "PduStatus",
+    "ComponentName", "PduName", "OnOutlets", "OffOutlets", "Resolved" }) do
+    C[name] = arr(Controls[name])
+  end
+
+  local function trim(s)
+    return ((s or ""):match("^%s*(.-)%s*$"))
+  end
+
+  ------------------------------------------------------------------
+  -- Range parsing: "all", "1-9", "1-4, 6-9", "one to nine", "all except 5", "!10", "none"
+  ------------------------------------------------------------------
+  local NumberWords = {
+    one = 1, two = 2, three = 3, four = 4, five = 5, six = 6, seven = 7, eight = 8, nine = 9, ten = 10,
+    eleven = 11, twelve = 12, thirteen = 13, fourteen = 14, fifteen = 15, sixteen = 16,
+    seventeen = 17, eighteen = 18, nineteen = 19, twenty = 20
+  }
+  local ExcludeWords = { except = true, ["not"] = true, exclude = true, excluding = true, but = true, without = true }
+
+  -- Returns sorted list of numbers in 1..max, and a list of unrecognised tokens.
+  local function parseSet(textIn, max)
+    local s = trim(textIn):lower()
+    if s == "none" then return {}, {} end
+    s = s:gsub("%a+", function(w) return NumberWords[w] and tostring(NumberWords[w]) or w end)
+    s = s:gsub("%s+to%s+", "-"):gsub("%s*%.%.%s*", "-"):gsub("%s*%-%s*", "-")
+    s = s:gsub("%f[%a]and%f[%A]", ",")
+
+    local inc, exc, bad = {}, {}, {}
+    local anyInc, excludeMode = false, false
+    for rawTok in s:gmatch("[^,;%s]+") do
+      local tok = rawTok
+      if ExcludeWords[tok] then
+        excludeMode = true
+      else
+        local neg = false
+        if tok:sub(1, 1) == "!" then
+          neg = true
+          tok = tok:sub(2)
+        end
+        local target = (neg or excludeMode) and exc or inc
+        if tok == "all" or tok == "*" then
+          for i = 1, max do inc[i] = true end
+          anyInc = true
+        else
+          local a, b = tok:match("^(%d+)%-(%d+)$")
+          if not a then
+            a = tok:match("^(%d+)$")
+            b = a
+          end
+          if a then
+            a, b = tonumber(a), tonumber(b)
+            if a > b then a, b = b, a end
+            for i = a, math.min(b, max) do target[i] = true end
+            if target == inc then anyInc = true end
+          elseif tok ~= "" then
+            table.insert(bad, rawTok)
+          end
+        end
+      end
+    end
+    if not anyInc then
+      for i = 1, max do inc[i] = true end
+    end
+    local list = {}
+    for i = 1, max do
+      if inc[i] and not exc[i] then table.insert(list, i) end
+    end
+    return list, bad
+  end
+
+  -- {1,2,3,5,7,8} -> "1-3, 5, 7-8"
+  local function compact(list)
+    local parts, i = {}, 1
+    while i <= #list do
+      local j = i
+      while j < #list and list[j + 1] == list[j] + 1 do j = j + 1 end
+      if j > i then
+        table.insert(parts, list[i] .. "-" .. list[j])
+      else
+        table.insert(parts, tostring(list[i]))
+      end
+      i = j + 1
+    end
+    if #parts == 0 then return "none" end
+    return table.concat(parts, ", ")
+  end
+
+  ------------------------------------------------------------------
+  -- PDU binding
+  ------------------------------------------------------------------
+  -- Gude Expert Power Control plugin. Component Type looks like
+  -- %PLUGIN%_155aca43-286f-4b5d-8063-a567999c55e3_%FP%_<hash>; the hash changes per version.
+  local GudePluginId = "155aca43-286f-4b5d-8063-a567999c55e3"
+
+  local MetricKeys = { "power", "current", "energy", "voltage" }
+  local MetricNames = { Power = "power", Current = "current", Energy = "energy", Voltage = "voltage" }
+  local SingleCtls = { Status = "status", Disable = "disable", Model = "model", Uptime = "uptime", IPAddress = "ip" }
+
+  local pdus = {}
+
+  local function displayName(i)
+    local nm = trim(C.PduName[i] and C.PduName[i].String)
+    if nm == "" then return "PDU " .. i end
+    return nm
+  end
+
+  local function bind(i)
+    local p = {
+      index = i, outlets = {}, outletNums = {}, online = false, ctl = {},
+      meters = {
+        Inlet = { power = {}, current = {}, energy = {}, voltage = {} },
+        Outlet = { power = {}, current = {}, energy = {}, voltage = {} },
+      }
+    }
+    pdus[i] = p
+    p.name = trim(C.ComponentName[i].String)
+    if p.name == "" then
+      p.reason = "Not assigned"
+      p.unassigned = true
+      return p
+    end
+    local ok, ctls = pcall(Component.GetControls, p.name)
+    if not ok or type(ctls) ~= "table" or #ctls == 0 then
+      p.reason = "Component '" .. p.name .. "' not found (check name / Script Access)"
+      return p
+    end
+    p.comp = Component.New(p.name)
+
+    for _, c in ipairs(ctls) do
+      local cname = c.Name or ""
+      local src, kind, num = cname:match("^(Outlet)(%a+)%s+(%d+)$")
+      if not src then src, kind, num = cname:match("^(Inlet)(%a+)%s+(%d+)$") end
+      num = tonumber(num)
+      if src == "Outlet" and (kind == "On" or kind == "Off" or kind == "State" or kind == "Name") then
+        p.outlets[num] = p.outlets[num] or {}
+        p.outlets[num][kind:lower()] = cname
+      elseif (src == "Inlet" or src == "Outlet") and MetricNames[kind] then
+        table.insert(p.meters[src][MetricNames[kind]], cname)
+      elseif SingleCtls[cname] then
+        p.ctl[SingleCtls[cname]] = cname
+      end
+    end
+
+    for num, o in pairs(p.outlets) do
+      if o.on or o.off then table.insert(p.outletNums, num) end
+    end
+    table.sort(p.outletNums)
+    for _, src in pairs(p.meters) do
+      for _, list in pairs(src) do
+        table.sort(list, function(a, b) return tonumber(a:match("%d+$")) < tonumber(b:match("%d+$")) end)
+      end
+    end
+    p.maxOutlet = p.outletNums[#p.outletNums] or 0
+    p.online = #p.outletNums > 0
+    if not p.online then p.reason = "No OutletOn/OutletOff controls on '" .. p.name .. "'" end
+    log(("Bound PDU %d '%s': %d outlets"):format(i, p.name, #p.outletNums))
+    return p
+  end
+
+  local function bindAll()
+    for i = 1, N do bind(i) end
+  end
+
+  -- Outlet list for a PDU: "on" or "off"
+  local function outletList(i, which)
+    local p = pdus[i]
+    if not p or not p.online then return {}, {} end
+    local own = which == "on" and C.OnOutlets[i] or C.OffOutlets[i]
+    local textIn = trim(own and own.String)
+    if textIn == "" then
+      textIn = which == "on" and Controls.DefaultOnOutlets.String or Controls.DefaultOffOutlets.String
+    end
+    local list, bad = parseSet(textIn, p.maxOutlet)
+    local out = {}
+    for _, n in ipairs(list) do
+      if p.outlets[n] and p.outlets[n][which] then table.insert(out, n) end
+    end
+    return out, bad
+  end
+
+  local function updateResolved(i)
+    local p = pdus[i]
+    local r = C.Resolved[i]
+    if not r then return end
+    if not p or not p.online then
+      r.String = p and p.reason or ""
+      return
+    end
+    local onL, badOn = outletList(i, "on")
+    local offL, badOff = outletList(i, "off")
+    local s = ("%d outlets | On: %s | Off: %s"):format(#p.outletNums, compact(onL), compact(offL))
+    if #badOn + #badOff > 0 then
+      local bad = {}
+      for _, b in ipairs(badOn) do table.insert(bad, b) end
+      for _, b in ipairs(badOff) do table.insert(bad, b) end
+      s = s .. " | ignored: " .. table.concat(bad, " ")
+    end
+    r.String = s
+  end
+
+  local function updateAllResolved()
+    for i = 1, N do updateResolved(i) end
+  end
+
+  local function allScope()
+    local list, bad = parseSet(Controls.AllScope.String, N)
+    local names = {}
+    for _, i in ipairs(list) do table.insert(names, i) end
+    local s = "All On/Off PDUs: " .. compact(names)
+    if #bad > 0 then s = s .. "  (ignored: " .. table.concat(bad, " ") .. ")" end
+    Controls.AllScopeResult.String = s
+    return list
+  end
+
+  ------------------------------------------------------------------
+  -- Reading values
+  ------------------------------------------------------------------
+  local function readCtl(p, cname)
+    local ok, ctl = pcall(function() return p.comp[cname] end)
+    if ok then return ctl end
+  end
+
+  local Prefix = { m = 0.001, k = 1000, K = 1000, M = 1000000 }
+  local BaseUnit = { power = "W", current = "A", energy = "Wh", voltage = "V" }
+
+  -- Gude values are strings such as "123.4 W", "0.52A", "12.345 kWh", "230 V".
+  -- Returns the value in base units (W, A, Wh, V); nil when empty / non-numeric.
+  local function parseMeasure(s, key)
+    s = trim(s):gsub(",", ".")
+    local num, unit = s:match("^([-+]?%d*%.?%d+)%s*(%a*)")
+    num = tonumber(num)
+    if not num then return nil end
+    local base = BaseUnit[key]
+    if unit ~= "" and unit ~= base and unit:sub(-#base) == base then
+      num = num * (Prefix[unit:sub(1, #unit - #base)] or 1)
+    elseif unit == "" and key == "energy" then
+      num = num * 1000 -- unitless energy assumed kWh
+    end
+    return num
+  end
+
+  local function readMeasure(p, cname, key)
+    local ctl = readCtl(p, cname)
+    if not ctl then return nil end
+    local v = parseMeasure(ctl.String or "", key)
+    if v == nil and tonumber(ctl.Value) and ctl.String == "" then v = tonumber(ctl.Value) end
+    return v
+  end
+
+  local function meterSource()
+    return Controls.MeterSource.String == "Outlets" and "Outlet" or "Inlet"
+  end
+
+  local function fmt(v, unit)
+    if v == nil then return "--" end
+    local s
+    if math.abs(v) >= 100 then s = ("%.0f"):format(v)
+    elseif math.abs(v) >= 10 then s = ("%.1f"):format(v)
+    else s = ("%.2f"):format(v) end
+    return s .. " " .. unit
+  end
+
+  local function fmtEnergy(wh)
+    if wh == nil then return "--" end
+    return fmt(wh / 1000, "kWh")
+  end
+
+  local function update()
+    local tot = { power = nil, current = nil, energy = nil }
+    local vSum, vCount = 0, 0
+    local onlineCount, assignedCount, outletsOn, outletsTotal = 0, 0, 0, 0
+    local issues, healthy = {}, 0
+
+    for i = 1, N do
+      local p = pdus[i]
+      if p and not p.online and not p.unassigned then p = bind(i) end
+      local st = C.PduStatus[i]
+
+      if not p or not p.online then
+        C.PduLed[i].Boolean = false
+        C.PduState[i].String = p and p.unassigned and "" or "Offline"
+        if METERING then
+          C.PduPower[i].String, C.PduCurrent[i].String, C.PduEnergy[i].String = "", "", ""
+        end
+        if p and p.unassigned then
+          st.Value = 3
+          st.String = "Not assigned"
+        else
+          assignedCount = assignedCount + 1
+          st.Value = 4
+          st.String = p and p.reason or "Missing"
+          table.insert(issues, displayName(i) .. ": " .. (p and p.reason or "missing"))
+        end
+      else
+        assignedCount = assignedCount + 1
+        onlineCount = onlineCount + 1
+
+        -- Outlet state
+        local onSet, offSet = {}, {}
+        for _, n in ipairs(outletList(i, "on")) do onSet[n] = true end
+        for _, n in ipairs(outletList(i, "off")) do offSet[n] = true end
+        local allOn, allOff, anyOnSet, anyOffSet = true, true, false, false
+        local count, total = 0, 0
+        for _, n in ipairs(p.outletNums) do
+          local o = p.outlets[n]
+          if o.state then
+            local ctl = readCtl(p, o.state)
+            local isOn = ctl and ctl.Boolean or false
+            total = total + 1
+            if isOn then count = count + 1 end
+            if onSet[n] then anyOnSet = true; if not isOn then allOn = false end end
+            if offSet[n] then anyOffSet = true; if isOn then allOff = false end end
+          end
+        end
+        outletsOn, outletsTotal = outletsOn + count, outletsTotal + total
+        local stateText
+        if total == 0 then stateText = "No feedback"
+        elseif allOn and anyOnSet and count > 0 then stateText = "On"
+        elseif allOff and anyOffSet then stateText = "Off"
+        else stateText = "Partial" end
+        if total > 0 then stateText = ("%s (%d/%d)"):format(stateText, count, total) end
+        C.PduState[i].String = stateText
+        C.PduLed[i].Boolean = count > 0 and not (allOff and anyOffSet)
+
+        -- Metering
+        -- Power/current/energy are summed; voltage is averaged over live (non-zero) readings,
+        -- so an unused second inlet doesn't drag the average down.
+        if METERING then
+          local vals = {}
+          local src = p.meters[meterSource()]
+          for _, key in ipairs(MetricKeys) do
+            local sum, n = 0, 0
+            for _, cname in ipairs(src[key]) do
+              local v = readMeasure(p, cname, key)
+              if v and not (key == "voltage" and v <= 0) then sum = sum + v; n = n + 1 end
+            end
+            if n > 0 then vals[key] = key == "voltage" and sum / n or sum end
+          end
+          C.PduPower[i].String = fmt(vals.power, "W")
+          C.PduCurrent[i].String = fmt(vals.current, "A")
+          C.PduEnergy[i].String = fmtEnergy(vals.energy)
+          for _, k in ipairs({ "power", "current", "energy" }) do
+            if vals[k] then tot[k] = (tot[k] or 0) + vals[k] end
+          end
+          if vals.voltage then vSum, vCount = vSum + vals.voltage, vCount + 1 end
+        end
+
+        -- Status reported by the PDU plugin itself
+        local code, msg = 0, "OK"
+        if p.ctl.status then
+          local sc = readCtl(p, p.ctl.status)
+          if sc then
+            code = tonumber(sc.Value) or 0
+            msg = sc.String ~= "" and sc.String or msg
+          end
+        end
+        local dis = p.ctl.disable and readCtl(p, p.ctl.disable)
+        if dis and dis.Boolean then
+          code, msg = 3, "Disabled"
+        end
+        st.Value = code
+        st.String = msg
+        if code == 0 then
+          healthy = healthy + 1
+        else
+          table.insert(issues, displayName(i) .. ": " .. msg)
+        end
+      end
+    end
+
+    Controls.PDUsOnline.String = ("%d / %d"):format(onlineCount, assignedCount)
+    Controls.OutletsOn.String = ("%d / %d"):format(outletsOn, outletsTotal)
+    if METERING then
+      Controls.TotalPower.String = fmt(tot.power, "W")
+      Controls.TotalCurrent.String = fmt(tot.current, "A")
+      Controls.TotalEnergy.String = fmtEnergy(tot.energy)
+      Controls.AvgVoltage.String = vCount > 0 and fmt(vSum / vCount, "V") or "--"
+    end
+
+    local code
+    if assignedCount == 0 then
+      code = 3
+      Controls.Status.Value = code
+      Controls.Status.String = "No PDUs assigned (see Setup page)"
+    else
+      if #issues == 0 then code = 0
+      elseif healthy > 0 then code = 1
+      else code = 2 end
+      Controls.Status.Value = code
+      if code == 0 then
+        Controls.Status.String = ("All %d PDUs OK"):format(healthy)
+      else
+        Controls.Status.String = ("%d/%d OK - %s"):format(healthy, assignedCount, table.concat(issues, "; "))
+      end
+    end
+  end
+
+  ------------------------------------------------------------------
+  -- Switching
+  ------------------------------------------------------------------
+  local function switchPdu(i, on)
+    local p = pdus[i]
+    if not p or not p.online then return 0 end
+    local which = on and "on" or "off"
+    local list = outletList(i, which)
+    for _, n in ipairs(list) do
+      local cname = p.outlets[n][which]
+      local ctl = readCtl(p, cname)
+      if ctl then ctl:Trigger() end
+    end
+    log(("%s %s outlets %s"):format(displayName(i), which, compact(list)))
+    return #list
+  end
+
+  local refreshTimer = Timer.New()
+  refreshTimer.EventHandler = function()
+    refreshTimer:Stop()
+    update()
+  end
+
+  local function run(indices, on, source)
+    local stagger = math.max(Controls.Stagger.Value, 0)
+    local names, delay = {}, 0
+    for k, i in ipairs(indices) do
+      local p = pdus[i]
+      if p and p.online then
+        table.insert(names, displayName(i))
+        if delay <= 0 then
+          switchPdu(i, on)
+        else
+          Timer.CallAfter(function() switchPdu(i, on) end, delay)
+        end
+        delay = delay + stagger
+        C.PduState[i].String = on and "Switching on..." or "Switching off..."
+      end
+    end
+    local summary = #names > 0 and table.concat(names, ", ") or "no online PDUs"
+    Controls.LastAction.String = ("%s %s: %s"):format(source, on and "ON" or "OFF", summary)
+    refreshTimer:Stop()
+    refreshTimer:Start(delay + 1.5)
+  end
+
+  local function selectedIndices()
+    local list = {}
+    for i = 1, N do
+      if C.Select[i].Boolean then table.insert(list, i) end
+    end
+    return list
+  end
+
+  local function clearSelection()
+    for i = 1, N do C.Select[i].Boolean = false end
+  end
+
+  local function runSelected(on)
+    local list = selectedIndices()
+    if #list == 0 then
+      Controls.LastAction.String = "Nothing selected"
+      return
+    end
+    run(list, on, "Selected")
+    if Controls.AutoClear.Boolean then clearSelection() end
+  end
+
+  Controls.On.EventHandler = function() runSelected(true) end
+  Controls.Off.EventHandler = function() runSelected(false) end
+  Controls.SelectAll.EventHandler = function()
+    for i = 1, N do C.Select[i].Boolean = pdus[i] ~= nil and pdus[i].online end
+  end
+  Controls.SelectNone.EventHandler = clearSelection
+
+  ------------------------------------------------------------------
+  -- Press and hold All On / All Off
+  ------------------------------------------------------------------
+  local hold = { timer = Timer.New(), which = nil, start = 0, fired = false }
+
+  local function stopHold()
+    hold.timer:Stop()
+    hold.which = nil
+    Controls.HoldProgress.Position = 0
+  end
+
+  hold.timer.EventHandler = function()
+    if not hold.which then return stopHold() end
+    local ht = math.max(Controls.HoldTime.Value, 0)
+    local elapsed = Timer.Now() - hold.start
+    Controls.HoldProgress.Position = ht > 0 and math.min(elapsed / ht, 1) or 1
+    if not hold.fired and elapsed >= ht then
+      hold.fired = true
+      run(allScope(), hold.which == "on", "All")
+    end
+  end
+
+  local function holdHandler(which)
+    return function(ctl)
+      if ctl.Boolean then
+        hold.which = which
+        hold.start = Timer.Now()
+        hold.fired = false
+        Controls.HoldProgress.Position = 0
+        hold.timer:Start(0.05)
+      elseif hold.which == which then
+        stopHold()
+      end
+    end
+  end
+
+  Controls.AllOn.EventHandler = holdHandler("on")
+  Controls.AllOff.EventHandler = holdHandler("off")
+
+  ------------------------------------------------------------------
+  -- Setup handlers
+  ------------------------------------------------------------------
+  local function findPduComponents()
+    local names = {}
+    local ok, comps = pcall(Component.GetComponents)
+    if not ok or type(comps) ~= "table" then return names end
+    for _, c in ipairs(comps) do
+      if tostring(c.Type or ""):find(GudePluginId, 1, true) then
+        table.insert(names, c.Name)
+      end
+    end
+    table.sort(names)
+    return names
+  end
+
+  local function refreshChoices()
+    local names = findPduComponents()
+    local choices = { "" }
+    for _, n in ipairs(names) do table.insert(choices, n) end
+    for i = 1, N do C.ComponentName[i].Choices = choices end
+    log(("Found %d Gude PDU components"):format(#names))
+  end
+
+  local function refreshLegend(i)
+    C.Select[i].Legend = displayName(i)
+  end
+
+  local poll = Timer.New()
+  poll.EventHandler = update
+
+  local function startPoll()
+    poll:Stop()
+    poll:Start(math.max(Controls.PollInterval.Value, 1))
+  end
+
+  local function rebindAll()
+    bindAll()
+    updateAllResolved()
+    for i = 1, N do refreshLegend(i) end
+    update()
+  end
+
+  for i = 1, N do
+    C.ComponentName[i].EventHandler = function()
+      bind(i)
+      updateResolved(i)
+      update()
+    end
+    C.PduName[i].EventHandler = function()
+      refreshLegend(i)
+    end
+    C.OnOutlets[i].EventHandler = function()
+      updateResolved(i)
+      update()
+    end
+    C.OffOutlets[i].EventHandler = C.OnOutlets[i].EventHandler
+  end
+
+  Controls.DefaultOnOutlets.EventHandler = function()
+    updateAllResolved()
+    update()
+  end
+  Controls.DefaultOffOutlets.EventHandler = Controls.DefaultOnOutlets.EventHandler
+  Controls.AllScope.EventHandler = function() allScope() end
+  Controls.PollInterval.EventHandler = startPoll
+  if METERING then
+    Controls.MeterSource.Choices = { "Inlets", "Outlets" }
+    if Controls.MeterSource.String ~= "Outlets" then Controls.MeterSource.String = "Inlets" end
+    Controls.MeterSource.EventHandler = update
+  end
+
+  ------------------------------------------------------------------
+  -- Init
+  ------------------------------------------------------------------
+  refreshChoices()
+  rebindAll()
+  allScope()
+  startPoll()
+end
