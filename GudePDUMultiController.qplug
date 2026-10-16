@@ -7,10 +7,11 @@
 --
 -- Requirements: each Gude PDU plugin must have Script Access enabled (Script or All).
 -- Gude components are found by plugin GUID 155aca43-286f-4b5d-8063-a567999c55e3.
+-- Device health mirrors the source Status control; Disable does not override it.
 
 PluginInfo = {
   Name = "Gude~PDU Multi Controller",
-  Version = "1.0.10",
+  Version = "1.0.11",
   Id = "9f79b1c0-43f7-485a-9f80-bc6607cafaec",
   Author = "James Martin",
   Description = "Groups multiple Gude PDU plugins: selective on/off, hold-to-switch all, outlet filters and aggregated metering/status.",
@@ -763,17 +764,19 @@ if Controls then
         end
 
         -- Status reported by the PDU plugin itself
-        local code, msg = 0, "OK"
+        local code, msg = 2, "Status control unavailable (check Script Access)"
         if p.ctl.status then
           local sc = readCtl(p, p.ctl.status)
           if sc then
-            code = tonumber(sc.Value) or 0
-            msg = sc.String ~= "" and sc.String or msg
+            local value = tonumber(sc.Value)
+            if value and value >= 0 and value <= 5 and value % 1 == 0 then
+              code = value
+              local statusNames = { [0] = "OK", "Compromised", "Fault", "Not Present", "Missing", "Initializing" }
+              msg = sc.String ~= "" and sc.String or statusNames[code]
+            else
+              msg = "Invalid source Status value"
+            end
           end
-        end
-        local dis = p.ctl.disable and readCtl(p, p.ctl.disable)
-        if dis and dis.Boolean then
-          code, msg = 3, "Disabled"
         end
         -- In emulation the device plugins are disabled / not present; don't report that as a fault
         if EMULATING then code, msg = 0, "OK" end
