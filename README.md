@@ -51,6 +51,6 @@ Metering is off by default. Turn it on in the plugin properties to add power, cu
 
 - **Deselect After On/Off.** Off by default, so your selection stays put after switching.
 - **Hold Time, Stagger and Poll Interval.** Adjustable on the Setup page.
-- **Debug Print.** A property that writes what the plugin is doing to the Q-SYS log.
+- **Diagnostics.** Discovery, binding and switching messages always print to the Q-SYS log; there is no Debug Print property.
 
 The plugin only controls Gude plugins already in the design. It does not talk to the PDUs directly.
