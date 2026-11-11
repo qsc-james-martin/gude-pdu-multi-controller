@@ -11,7 +11,7 @@
 
 PluginInfo = {
   Name = "Gude~PDU Multi Controller",
-  Version = "1.0.13",
+  Version = "1.0.14",
   Id = "9f79b1c0-43f7-485a-9f80-bc6607cafaec",
   Author = "James Martin",
   Description = "Groups multiple Gude PDU plugins: selective on/off, hold-to-switch all, outlet filters and aggregated metering/status."
@@ -129,7 +129,7 @@ end
 --------------------------------------------------------------------
 -- Layout
 --------------------------------------------------------------------
-local PageNames = { "Control", "Setup" }
+PageNames = { "Control", "Setup" }
 
 function GetPages(props)
   local pages = {}
