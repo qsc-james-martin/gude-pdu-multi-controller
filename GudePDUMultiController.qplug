@@ -3,6 +3,7 @@
 --  * Select PDUs and switch them on/off
 --  * Press-and-hold All On / All Off with a configurable PDU scope ("1-9", "1-4, 6-9", "all except 10" ...)
 --  * Per-PDU on/off outlet lists (include or exclude outlets)
+--  * Reset outlets shared by the on/off lists through the source Gude plugin
 --  * Aggregated power / current / energy / voltage (from InletX N or summed OutletX N) plus a combined status
 --
 -- Requirements: each Gude PDU plugin must have Script Access enabled (Script or All).
@@ -11,10 +12,10 @@
 
 PluginInfo = {
   Name = "Gude~PDU Multi Controller",
-  Version = "1.0.14",
+  Version = "1.0.17",
   Id = "9f79b1c0-43f7-485a-9f80-bc6607cafaec",
   Author = "James Martin",
-  Description = "Groups multiple Gude PDU plugins: selective on/off, hold-to-switch all, outlet filters and aggregated metering/status."
+  Description = "Groups multiple Gude PDU plugins: selective on/off/reset, hold-to-switch all, outlet filters and aggregated metering/status."
 }
 
 function GetColor(props)
@@ -93,6 +94,7 @@ function GetControls(props)
   add({ Name = "RowOn", ControlType = "Button", ButtonType = "Trigger", Count = n })
   add({ Name = "RowOff", ControlType = "Button", ButtonType = "Trigger", Count = n })
   add({ Name = "RowPower", ControlType = "Button", ButtonType = "Toggle", Count = n })
+  add({ Name = "RowReset", ControlType = "Button", ButtonType = "Trigger", Count = n })
   add({ Name = "PduLed", ControlType = "Indicator", IndicatorType = "Led", Count = n, PinStyle = "Output" })
   add({ Name = "PduState", ControlType = "Indicator", IndicatorType = "Text", Count = n, PinStyle = "Output" })
   if metering then
@@ -144,7 +146,7 @@ function GetControlLayout(props)
   local n = props["PDU Count"].Value
   local metering = props["Metering"].Value
   local page = PageNames[props["page_index"].Value]
-  local W = 640
+  local W = 688
 
   local function key(name, i)
     if n > 1 then return name .. " " .. i end
@@ -247,9 +249,9 @@ function GetControlLayout(props)
     -- Rows
     local y2 = y1 + 84 + 4
     group(ROWS_TITLE, 0, y2, W, 44 + n * 20)
-    local stx = 216
+    local stx = 264
     label("Select", 8, y2 + 20, 76, 16, "Center")
-    label("On / Off / Power", 108, y2 + 20, 104, 16, "Center")
+    label("On / Off / Power / Reset", 108, y2 + 20, 152, 16, "Center")
     for _, c in ipairs(COLS) do
       if not c.metering or metering then
         label(c[2], stx, y2 + 20, c[3], 16, "Center")
@@ -264,7 +266,8 @@ function GetControlLayout(props)
       button(key("RowOn", i), "On", 108, y, 32, 16, { 0, 170, 60 })
       button(key("RowOff", i), "Off", 142, y, 32, 16, { 210, 40, 40 })
       button(key("RowPower", i), "", 176, y, 36, 16, { 0, 170, 60 })
-      local cx = 216
+      button(key("RowReset", i), "Reset", 216, y, 44, 16, { 230, 160, 0 })
+      local cx = 264
       for _, c in ipairs(COLS) do
         if not c.metering or metering then
           text(key(c[1], i), cx, y, c[3], 16, true)
@@ -361,7 +364,8 @@ function GetControlLayout(props)
     MeterSource = "Global Settings~Meter Source"
   }
   local deviceNames = {
-    Select = "Select", RowOn = "On", RowOff = "Off", RowPower = "Power On/Off", PduLed = "Online", PduState = "State",
+    Select = "Select", RowOn = "On", RowOff = "Off", RowPower = "Power On/Off",
+    RowReset = "Reset", PduLed = "Online", PduState = "State",
     PduPower = "Power", PduCurrent = "Current", PduEnergy = "Energy",
     PduStatus = "Status", ComponentName = "Setup~Component",
     PduName = "Setup~Display Name", OnOutlets = "Setup~On Outlets",
@@ -399,7 +403,7 @@ if Controls then
   end
 
   C = {}
-  for _, name in ipairs({ "Select", "RowOn", "RowOff", "RowPower", "PduLed", "PduState", "PduPower", "PduCurrent", "PduEnergy", "PduStatus",
+  for _, name in ipairs({ "Select", "RowOn", "RowOff", "RowPower", "RowReset", "PduLed", "PduState", "PduPower", "PduCurrent", "PduEnergy", "PduStatus",
     "ComponentName", "PduName", "OnOutlets", "OffOutlets", "Resolved" }) do
     C[name] = arr(Controls[name])
   end
@@ -532,7 +536,7 @@ if Controls then
       local src, kind, num = cname:match("^(Outlet)(%a+)%s+(%d+)$")
       if not src then src, kind, num = cname:match("^(Inlet)(%a+)%s+(%d+)$") end
       num = tonumber(num)
-      if src == "Outlet" and (kind == "On" or kind == "Off" or kind == "State" or kind == "Name") then
+      if src == "Outlet" and (kind == "On" or kind == "Off" or kind == "Reset" or kind == "State" or kind == "Name") then
         p.outlets[num] = p.outlets[num] or {}
         p.outlets[num][kind:lower()] = cname
       elseif (src == "Inlet" or src == "Outlet") and MetricNames[kind] then
@@ -884,9 +888,47 @@ if Controls then
   end
   Controls.SelectNone.EventHandler = clearSelection
 
+  function resetFailure(i, message)
+    Controls.LastAction.String = displayName(i) .. " RESET: " .. message
+    log(Controls.LastAction.String)
+  end
+
+  function resetPdu(i)
+    local p = pdus[i]
+    if not p or not p.online then return resetFailure(i, "PDU is offline") end
+    local onList, badOn = outletList(i, "on")
+    local offList, badOff = outletList(i, "off")
+    if #badOn + #badOff > 0 then return resetFailure(i, "fix unrecognized On/Off outlet tokens before resetting") end
+    local onSet, outlets, resets = {}, {}, {}
+    for _, n in ipairs(onList) do onSet[n] = true end
+    for _, n in ipairs(offList) do
+      if onSet[n] then
+        local cname = p.outlets[n].reset
+        local ctl = cname and readCtl(p, cname)
+        if not ctl or ctl.IsDisabled then
+          return resetFailure(i, "OutletReset " .. n .. " is unavailable or disabled (check Script Access)")
+        end
+        table.insert(outlets, n)
+        table.insert(resets, ctl)
+      end
+    end
+    if #outlets == 0 then return resetFailure(i, "no outlets shared by the On and Off lists") end
+    local sent = {}
+    for k, ctl in ipairs(resets) do
+      local ok, err = pcall(function() ctl:Trigger() end)
+      if not ok then
+        return resetFailure(i, ("outlet %d trigger failed: %s | sent: %s (not retried)"):format(outlets[k], tostring(err), compact(sent)))
+      end
+      table.insert(sent, outlets[k])
+    end
+    Controls.LastAction.String = ("%s RESET sent: outlets %s"):format(displayName(i), compact(sent))
+    log(Controls.LastAction.String)
+  end
+
   for i = 1, N do
     C.RowOn[i].EventHandler = function() run({ i }, true, "Row") end
     C.RowOff[i].EventHandler = function() run({ i }, false, "Row") end
+    C.RowReset[i].EventHandler = function() resetPdu(i) end
     C.RowPower[i].EventHandler = function(ctl)
       local d = pdus[i]
       if d and d.online then
